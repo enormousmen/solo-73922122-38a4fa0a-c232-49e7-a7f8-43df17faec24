@@ -23,11 +23,20 @@ services:
       PGUSER: postgres
       PGPASSWORD: postgres
       PGDATABASE: orders_demo
+      # 轮换状态（当前业务账号与服务端口令）落盘目录，命名卷持久化：
+      # 服务重启后已生效的切换保留，未完成的轮换沿用原账号并可重试
+      ROTATION_STATE_DIR: /var/lib/order-demo
+      # 演示用：拉长验证窗口，便于观察"等待验证期间业务仍走原账号"；
+      # 生产环境留空或删除该变量
+      ROTATION_VERIFY_DELAY: "3"
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - rotation-state:/var/lib/order-demo
 
 volumes:
   pgdata:
+  rotation-state:

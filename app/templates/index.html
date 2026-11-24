@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>订单表批次号在线迁移演示</title>
+<title>订单库账号轮换与批次号在线迁移演示</title>
 <style>
   :root {
     --bg: #f4f6fa; --card: #fff; --line: #dfe4ec; --text: #1f2733;
@@ -31,8 +31,12 @@
   .b-succeeded { background: #dcfce7; color: var(--green); }
   .b-failed { background: #fee2e2; color: var(--red); }
   .b-cancelled { background: #e2e8f0; color: var(--gray); }
+  .b-verifying { background: #fef3c7; color: var(--amber); }
+  .b-switching { background: #dbeafe; color: var(--blue); }
   .b-yes { background: #dcfce7; color: var(--green); }
   .b-no { background: #f1f5f9; color: var(--muted); }
+  .b-active { background: #dcfce7; color: var(--green); }
+  .b-standby { background: #f1f5f9; color: var(--muted); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; }
   th { background: #f8fafc; font-weight: 600; }
@@ -65,8 +69,8 @@
 </head>
 <body>
 <header>
-  <h1>订单系统发版：orders / order_items 在线加批次号列（batch_no）</h1>
-  <p>PostgreSQL 锁等待演示 · 等锁期间普通读写不阻塞 · 两表 ALTER 同事务原子提交</p>
+  <h1>订单库运维演示：业务账号在线轮换 + orders / order_items 在线加批次号列</h1>
+  <p>两个 PostgreSQL 业务账号轮流启用 · 验证不落库 · 切换后旧账号拒绝新建会话 · 等锁期间普通读写不阻塞</p>
 </header>
 
 <main>
@@ -79,15 +83,44 @@
       </select>
       <button onclick="openTx()">打开并保持读事务</button>
     </div>
-    <p class="muted" style="margin:8px 0">事务不提交也不回滚，直到值班员手动结束。</p>
+    <p class="muted" style="margin:8px 0">事务不提交也不回滚，直到值班员手动结束。使用打开时刻的当前业务账号。</p>
     <table>
-      <thead><tr><th>令牌</th><th>表</th><th>PID</th><th>开始</th><th>操作</th></tr></thead>
-      <tbody id="txBody"><tr><td colspan="5" class="muted">暂无打开的演示事务</td></tr></tbody>
+      <thead><tr><th>令牌</th><th>表</th><th>PID</th><th>账号</th><th>开始</th><th>操作</th></tr></thead>
+      <tbody id="txBody"><tr><td colspan="6" class="muted">暂无打开的演示事务</td></tr></tbody>
     </table>
   </section>
 
   <section class="card">
-    <h2>② 加列迁移申请</h2>
+    <h2>② 业务账号轮换（app_a / app_b 轮流启用）</h2>
+    <div class="kv">
+      <b>轮换状态</b><span id="rotState"></span>
+      <b>当前账号</b><span id="rotActive"></span>
+      <b>备用账号</b><span id="rotStandby"></span>
+      <b>已成功轮换</b><span id="rotGeneration">0 次</span>
+      <b>开始/完成</b><span id="rotTimes">-</span>
+      <b>失败原因</b><span id="rotError" class="err"></span>
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>账号</th><th>角色</th><th>PostgreSQL 登录权</th></tr></thead>
+      <tbody id="rotRoles"></tbody>
+    </table>
+    <div class="row" style="margin-top:12px">
+      <label><input type="checkbox" id="rotInject"> 故障注入（备用账号口令错误，验证失败应沿用原账号）</label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnRotate" onclick="startRotation()">发起轮换</button>
+    </div>
+    <p class="hint" style="margin:10px 0 0">
+      每次轮换给备用账号生成新口令，实际连库验证两张业务表都能读能写
+      （验证事务回滚、<b>数据不落库</b>）后才切换；等待验证期间新发起的
+      查单/试写仍走原账号；切换成功后业务只用新账号建连，旧账号被置
+      NOLOGIN、拒绝新建会话，但切换前打开的演示事务仍可手动结束。
+      口令只在服务端使用，不经过页面与接口。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>③ 加列迁移申请</h2>
     <div class="kv">
       <b>当前状态</b><span id="migState"></span>
       <b>申请时间</b><span id="migRequested">-</span>
@@ -105,23 +138,8 @@
     <p class="muted" id="cancelHint" style="margin:8px 0 0"></p>
   </section>
 
-  <section class="card full">
-    <h2>③ 批次号列是否生效</h2>
-    <table>
-      <thead><tr><th>表</th><th>batch_no 列</th><th>说明</th></tr></thead>
-      <tbody id="colBody"></tbody>
-    </table>
-    <p class="hint" style="margin-top:10px">
-      实现要点：迁移线程先用 pg_locks 探测两表上的冲突锁，无冲突才在
-      <b>同一个数据库事务</b>里执行两条 ALTER TABLE，并设置 250ms
-      lock_timeout 兜底；拿不到锁就回滚本轮、0.5s 后重试，
-      <b>不进入 PostgreSQL 服务器端锁队列</b>，因此等锁期间新发起的
-      普通读写都能立即完成。
-    </p>
-  </section>
-
   <section class="card">
-    <h2>④ 试写订单 / 明细（等锁期间也应秒回）</h2>
+    <h2>④ 试写订单 / 明细（轮换验证与迁移等锁期间也应秒回）</h2>
     <div class="row">
       <input id="inCustomer" placeholder="客户名" value="王五">
       <input id="inSku" placeholder="商品 SKU" value="SKU-D900">
@@ -140,8 +158,23 @@
     <p id="readResult" class="ok"></p>
   </section>
 
-  <section class="card">
-    <h2>⑤ 服务器端锁队列实况（pg_locks）</h2>
+  <section class="card full">
+    <h2>⑤ 批次号列是否生效</h2>
+    <table>
+      <thead><tr><th>表</th><th>batch_no 列</th><th>说明</th></tr></thead>
+      <tbody id="colBody"></tbody>
+    </table>
+    <p class="hint" style="margin-top:10px">
+      实现要点：迁移线程先用 pg_locks 探测两表上的冲突锁，无冲突才在
+      <b>同一个数据库事务</b>里执行两条 ALTER TABLE，并设置 250ms
+      lock_timeout 兜底；拿不到锁就回滚本轮、0.5s 后重试，
+      <b>不进入 PostgreSQL 服务器端锁队列</b>，因此等锁期间新发起的
+      普通读写都能立即完成。
+    </p>
+  </section>
+
+  <section class="card full">
+    <h2>⑥ 服务器端锁队列实况（pg_locks）</h2>
     <table>
       <thead><tr><th>表</th><th>锁模式</th><th>已授予</th><th>会话状态</th><th>SQL</th></tr></thead>
       <tbody id="lockBody"><tr><td colspan="5" class="muted">无</td></tr></tbody>
@@ -153,7 +186,7 @@
   </section>
 
   <section class="card full">
-    <h2>⑥ 样例订单与明细</h2>
+    <h2>⑦ 样例订单与明细</h2>
     <table>
       <thead id="ordersHead"></thead>
       <tbody id="ordersBody"></tbody>
@@ -161,12 +194,14 @@
   </section>
 
   <section class="card full">
-    <h2>事件日志</h2>
+    <h2>事件日志（迁移 + 账号轮换）</h2>
     <pre id="eventLog" class="log"></pre>
     <ul class="steps">
-      <li>步骤 1：在 ① 打开任一表演示事务并保持；</li>
-      <li>步骤 2：在 ② 提交加列，状态变为"等待锁中"，此时在 ④ 试写/查询均秒回；</li>
-      <li>步骤 3：在 ① 手动结束演示事务，迁移自动继续，两列一同生效；</li>
+      <li>轮换步骤 1：在 ② 发起轮换，备用账号生成新口令并进入验证，此时在 ④ 试写/查询仍走原账号且秒回；</li>
+      <li>轮换步骤 2：验证两表读写通过（不落库）后自动切换，当前账号翻转、旧账号失去登录权；可再次发起轮换切回；</li>
+      <li>迁移步骤 1：在 ① 打开任一表演示事务并保持；</li>
+      <li>迁移步骤 2：在 ③ 提交加列，状态变为"等待锁中"，此时在 ④ 试写/查询均秒回；</li>
+      <li>迁移步骤 3：在 ① 手动结束演示事务，迁移自动继续，两列一同生效；</li>
       <li>也可在等待中撤销，撤销后即使结束演示事务也不会加列；勾选故障注入可验证失败回滚。</li>
     </ul>
   </section>
@@ -217,6 +252,14 @@ async function cancelMigration() {
   catch (e) { alert(e.message); }
   refresh();
 }
+async function startRotation() {
+  try {
+    await post("/api/rotation/start", {
+      inject_failure: document.getElementById("rotInject").checked,
+    });
+  } catch (e) { alert(e.message); }
+  refresh();
+}
 async function createOrder() {
   const t0 = performance.now();
   try {
@@ -243,7 +286,7 @@ async function readOrders() {
     await api("/api/orders");
     const ms = (performance.now() - t0).toFixed(1);
     document.getElementById("readResult").textContent =
-      `普通查询完成，耗时 ${ms} ms（等锁期间也应是毫秒级）`;
+      `普通查询完成，耗时 ${ms} ms（轮换/迁移期间也应是毫秒级）`;
   } catch (e) {
     document.getElementById("readResult").textContent = "查询失败：" + e.message;
   }
@@ -253,6 +296,29 @@ async function resetDemo() {
   try { await post("/api/reset"); }
   catch (e) { alert(e.message); }
   refresh();
+}
+
+function renderRotation(r) {
+  const st = document.getElementById("rotState");
+  st.innerHTML = `<span class="badge b-${r.state}">${esc(r.state_label)}</span>`;
+  document.getElementById("rotActive").innerHTML =
+    `<span class="badge b-active">${esc(r.active_role)}</span>`;
+  document.getElementById("rotStandby").textContent = r.standby_role;
+  document.getElementById("rotGeneration").textContent = `${r.generation} 次`;
+  document.getElementById("rotTimes").textContent =
+    [r.last_started_at, r.last_finished_at].filter(Boolean).join(" / ") || "-";
+  document.getElementById("rotError").textContent = r.error || "";
+  document.getElementById("btnRotate").disabled = r.in_flight;
+  document.getElementById("rotInject").disabled = r.in_flight;
+  const rotRoles = document.getElementById("rotRoles");
+  rotRoles.innerHTML = r.roles.map(x => `
+    <tr><td><b>${esc(x.role)}</b></td>
+    <td>${x.active
+        ? '<span class="badge b-active">当前启用</span>'
+        : '<span class="badge b-standby">备用</span>'}</td>
+    <td>${x.can_login
+        ? '<span class="badge b-yes">允许 LOGIN</span>'
+        : '<span class="badge b-no">NOLOGIN（拒绝新建会话）</span>'}</td></tr>`).join("");
 }
 
 function renderState(s) {
@@ -273,13 +339,16 @@ function renderState(s) {
   document.getElementById("injectFailure").disabled =
       m.state === "waiting" || m.state === "running";
 
+  renderRotation(s.rotation);
+
   const txBody = document.getElementById("txBody");
   if (!s.held_transactions.length) {
-    txBody.innerHTML = '<tr><td colspan="5" class="muted">暂无打开的演示事务</td></tr>';
+    txBody.innerHTML = '<tr><td colspan="6" class="muted">暂无打开的演示事务</td></tr>';
   } else {
     txBody.innerHTML = s.held_transactions.map(t => `
       <tr><td>${esc(t.token)}</td><td><span class="pill">${esc(t.table)}</span></td>
-      <td>${t.pid}</td><td>${esc(t.started_at)}</td>
+      <td>${t.pid}</td><td><span class="pill">${esc(t.role || "")}</span></td>
+      <td>${esc(t.started_at)}</td>
       <td><button class="danger" onclick="closeTx('${esc(t.token)}')">手动结束（释放锁）</button></td>
       </tr>`).join("");
   }
@@ -303,8 +372,10 @@ function renderState(s) {
       <td>${esc(l.state)}</td><td class="muted">${esc(l.query)}</td></tr>`).join("");
   }
 
+  const rotEvents = (s.rotation?.events || []).map(e => `[轮换] ${e.time}  ${e.message}`);
+  const migEvents = m.events.map(e => `[迁移] ${e.time}  ${e.message}`);
   document.getElementById("eventLog").textContent =
-      m.events.map(e => `${e.time}  ${e.message}`).join("\n") || "（暂无事件）";
+      rotEvents.concat(migEvents).join("\n") || "（暂无事件）";
 }
 
 function renderOrders(orders, done) {
